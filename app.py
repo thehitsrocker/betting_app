@@ -1,53 +1,59 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import requests
 
-# Page config
-st.set_page_config(page_title="Pro Betting Dashboard", layout="wide")
+# 1. API Configuration (Get a free key at the-odds-api.com)
+# For security, you should put this in Streamlit's "Secrets" in the dashboard
+API_KEY = st.sidebar.text_input("Enter Odds API Key", type="password")
+SPORT = 'americanfootball_nfl' # Example: NFL
+REGIONS = 'us'
+MARKETS = 'h2h,spreads'
 
-# Sidebar for navigation
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Odds Calculator", "Settings"])
+st.set_page_config(page_title="Pro Betting Engine", layout="wide")
 
-if page == "Dashboard":
-    st.title("📈 Betting Performance")
+def fetch_odds():
+    if not API_KEY:
+        st.warning("Please enter your API key in the sidebar to fetch live data.")
+        return None
     
-    # KPIs in columns
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Profit", "$1,250", "+$150")
-    col2.metric("Win Rate", "64%", "+2%")
-    col3.metric("ROI", "12.5%", "-0.5%")
-
-    # Profit Chart
-    st.subheader("Profit Over Time")
-    chart_data = pd.DataFrame(
-        np.random.randn(20, 1).cumsum(), 
-        columns=['Profit']
-    )
-    st.line_chart(chart_data)
-
-    # Betting Log
-    st.subheader("Detailed Betting Log")
-    df = pd.DataFrame({
-        'Date': ['2024-03-01', '2024-03-02', '2024-03-03'],
-        'Sport': ['NBA', 'Soccer', 'NFL'],
-        'Bet': ['Lakers -3.5', 'Over 2.5 Goals', 'Chiefs ML'],
-        'Result': ['Won', 'Won', 'Lost'],
-        'Profit/Loss': [45.00, 22.50, -50.00]
-    })
-    st.dataframe(df, use_container_width=True)
-
-elif page == "Odds Calculator":
-    st.title("🧮 Odds Converter & Calculator")
+    url = f'https://api.the-odds-api.com{SPORT}/odds/?apiKey={API_KEY}&regions={REGIONS}&markets={MARKETS}'
+    response = requests.get(url)
     
-    # Multiple inputs
-    c1, c2 = st.columns(2)
-    with c1:
-        dec_odds = st.number_input("Decimal Odds", value=2.00)
-    with c2:
-        stake = st.number_input("Stake Amount ($)", value=100.00)
+    if response.status_code != 200:
+        st.error(f"Failed to get odds: {response.status_code}")
+        return None
+    else:
+        return response.json()
+
+st.title("🎯 Live Betting Engine")
+
+# Sidebar Filters
+st.sidebar.header("Market Filters")
+selected_sport = st.sidebar.selectbox("Select League", ["NFL", "NBA", "MLB", "EPL"])
+
+if st.button('Fetch Live Odds'):
+    data = fetch_odds()
     
-    profit = (dec_odds * stake) - stake
-    st.success(f"Potential Profit: **${profit:,.2f}**")
-    
-    st.info("Tip: Professional bettors usually look for an Edge > 5%.")
+    if data:
+        st.subheader(f"Current {selected_sport} Lines")
+        
+        # Flatten API data into a clean table
+        rows = []
+        for event in data:
+            home_team = event['home_team']
+            away_team = event['away_team']
+            for bookmaker in event['bookmakers']:
+                for market in bookmaker['markets']:
+                    if market['key'] == 'h2h':
+                        rows.append({
+                            "Match": f"{away_team} @ {home_team}",
+                            "Bookie": bookmaker['title'],
+                            "Away Odds": market['outcomes'][0]['price'],
+                            "Home Odds": market['outcomes'][1]['price']
+                        })
+        
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
+        
+        # Simple Arbitrage or Value Check Logic
+        st.info("💡 Analysis: Highlighting best available lines across bookmakers.")
