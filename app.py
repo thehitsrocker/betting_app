@@ -3,23 +3,29 @@ import pandas as pd
 import requests
 import time
 import base64
+from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 # --- 1. CONFIG & STYLING ---
-st.set_page_config(page_title="Kalshi Pro v15", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Kalshi Pro v19", page_icon="🎾", layout="wide")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0d1117; color: #e6edf3; }
     .card {
         background-color: #161b22; border: 1px solid #30363d;
-        border-radius: 8px; padding: 18px; margin-bottom: 12px;
+        border-radius: 8px; padding: 15px; margin-bottom: 10px;
     }
-    .price-box-yes { background: #002d11; color: #3fb950; padding: 5px 12px; border-radius: 4px; font-weight: bold; font-size: 20px; }
-    .price-box-no { background: #2d0001; color: #f85149; padding: 5px 12px; border-radius: 4px; font-weight: bold; font-size: 20px; }
-    .liq-box { color: #8b949e; font-size: 12px; margin-top: 5px; }
-    .meta { color: #8b949e; font-family: monospace; font-size: 11px; }
+    .status-tag {
+        font-weight: bold; font-size: 10px; padding: 2px 8px; 
+        border-radius: 4px; text-transform: uppercase; margin-bottom: 8px; display: inline-block;
+    }
+    .live-tag { color: #ff3e3e; border: 1px solid #ff3e3e; background: #2d0001; }
+    .upcoming-tag { color: #58a6ff; border: 1px solid #58a6ff; background: #00152d; }
+    .price-box { background: #26293b; padding: 10px; border-radius: 4px; text-align: center; min-width: 85px; border: 1px solid #3e445e; }
+    .yes-val { color: #3fb950; font-size: 20px; font-weight: bold; }
+    .no-val { color: #f85149; font-size: 20px; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -39,21 +45,12 @@ def sign_request(private_key_str, method, path, timestamp):
         return base64.b64encode(signature).decode("utf-8")
     except: return None
 
-# --- 3. SAFE DATA CONVERSION ---
-def to_float(val):
-    """Safely convert API strings/None to float."""
-    try:
-        return float(val) if val is not None else 0.0
-    except (ValueError, TypeError):
-        return 0.0
-
-# --- 4. DATA FETCHING ---
-@st.cache_data(ttl=60)
-def fetch_global_verified_feed():
+# --- 3. DATA FETCHING (MAX SCAN) ---
+@st.cache_data(ttl=30)
+def fetch_deep_scan():
     path = f"{BASE_PATH}/events"
     try:
-        key_id = st.secrets["KALSHI_KEY_ID"]
-        priv_key = st.secrets["KALSHI_PRIVATE_KEY"]
+        key_id, priv_key = st.secrets["KALSHI_KEY_ID"], st.secrets["KALSHI_PRIVATE_KEY"]
     except: return []
 
     ts = str(int(time.time() * 1000))
@@ -62,74 +59,85 @@ def fetch_global_verified_feed():
     
     results = []
     cursor = None
-    for _ in range(5):
+    # Scanning 8 pages (800 events) to ensure we catch all 108+ tennis matches
+    for _ in range(8):
         params = {"status": "open", "limit": 100, "with_nested_markets": True}
         if cursor: params["cursor"] = cursor
-        try:
-            res = requests.get(f"{HOST}{path}", headers=headers, params=params)
-            if res.status_code != 200: break
-            data = res.json()
-            results.extend(data.get("events", []))
-            cursor = data.get("cursor")
-            if not cursor: break
-        except: break
+        res = requests.get(f"{HOST}{path}", headers=headers, params=params)
+        if res.status_code != 200: break
+        data = res.json()
+        results.extend(data.get("events", []))
+        cursor = data.get("cursor")
+        if not cursor: break
     return results
 
-# --- 5. MAIN UI ---
+# --- 4. MAIN UI ---
 def main():
-    st.sidebar.title("📊 Pro Terminal v15")
-    view = st.sidebar.selectbox("Market Tier", ["Tennis", "Soccer", "Politics", "Crypto", "All Open"])
-    min_liq_input = st.sidebar.number_input("Min Liquidity ($)", 0, 1000000, 0)
+    st.sidebar.title("🎾 Match Monitor v19")
+    view = st.sidebar.selectbox("Filter", ["Tennis Next 24h", "Live Now", "Politics", "All"])
     
-    raw_data = fetch_global_verified_feed()
-    st.sidebar.caption(f"Backend Scanned: {len(raw_data)} Events")
+    all_events = fetch_deep_scan()
+    now = datetime.now(timezone.utc)
+    one_day_out = now + timedelta(hours=24)
 
     filtered = []
-    for e in raw_data:
-        e_title, e_ticker = e.get("title", "").lower(), e.get("ticker", "").upper()
+    for e in all_events:
+        t, tick = e.get("title", "").lower(), e.get("ticker", "").upper()
+        
+        # Time Logic
+        close_ts = datetime.fromisoformat(e.get("close_time").replace("Z", "+00:00"))
+        is_next_24h = now <= close_ts <= one_day_out
+        
+        # Tennis Logic (Strict Ticker)
+        is_tennis = any(x in tick for x in ["TENNIS", "KXWTA", "KXATP"]) or "tennis" in t
         
         match = False
-        if view == "All Open": match = True
-        elif view == "Tennis": match = any(x in e_ticker for x in ["TENNIS", "KXWTA", "KXATP"]) or "tennis" in e_title
-        elif view == "Soccer": match = any(x in e_ticker for x in ["SOC", "KXUCL", "KXMLS"]) or "soccer" in e_title
-        elif view == "Politics": match = e.get("category") == "Politics" or "election" in e_title
-        elif view == "Crypto": match = any(x in e_ticker for x in ["BTC", "ETH", "SOL", "DOGE"]) or "crypto" in e_title
+        if view == "Tennis Next 24h": match = is_tennis and is_next_24h
+        elif view == "Live Now": match = is_next_24h
+        elif view == "Politics": match = e.get("category") == "Politics"
+        elif view == "All": match = True
 
         if match:
             for m in e.get("markets", []):
-                # USE SAFE CONVERSION
-                liq = to_float(m.get('liquidity_dollars', 0))
+                y = int(float(m.get('yes_bid_dollars', 0)) * 100)
+                n = int(float(m.get('no_bid_dollars', 0)) * 100)
                 
-                if liq >= float(min_liq_input):
-                    y_cents = int(to_float(m.get('yes_bid_dollars', 0)) * 100)
-                    n_cents = int(to_float(m.get('no_bid_dollars', 0)) * 100)
-                    
-                    filtered.append({
-                        "ticker": m.get('ticker'),
-                        "event_name": e.get('title'),
-                        "market_title": m.get('title'),
-                        "y": y_cents,
-                        "n": n_cents,
-                        "liq": f"{int(liq):,}"
-                    })
+                filtered.append({
+                    "ticker": m.get('ticker'),
+                    "event": e.get('title'),
+                    "market": m.get('title'),
+                    "y": f"{y}¢" if y > 0 else "N/A",
+                    "n": f"{n}¢" if n > 0 else "N/A",
+                    "close_ts": close_ts
+                })
 
-    st.title(f"Live {view} Feed")
+    st.title(f"Feed: {view}")
     if not filtered:
-        st.info(f"No results for {view} matching your filters.")
+        st.info(f"No matches found. If you see 'Tennis Next 24h' is empty, Kalshi may have moved these to the 'Sports' category without a TENNIS ticker.")
     else:
-        for m in filtered:
+        st.write(f"Showing {len(filtered)} contracts closing within 24h.")
+        # Sort by closing time (closest first)
+        sorted_list = sorted(filtered, key=lambda x: x['close_ts'])
+        
+        for m in sorted_list:
+            time_diff = m['close_ts'] - now
+            hours_left = int(time_diff.total_seconds() // 3600)
+            mins_left = int((time_diff.total_seconds() % 3600) // 60)
+            
             st.markdown(f"""
                 <div class="card">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div style="max-width:70%;">
-                            <div class="meta">{m['ticker']}</div>
-                            <div style="font-size:18px; margin:4px 0;">{m['event_name']}</div>
-                            <div style="color:#8b949e; font-size:14px;">{m['market_title']}</div>
-                            <div class="liq-box">Liquidity: ${m['liq']}</div>
+                        <div style="max-width:75%;">
+                            <div class="status-tag {'live-tag' if hours_left < 1 else 'upcoming-tag'}">
+                                {'LIVE' if hours_left < 1 else 'UPCOMING'} - CLoses in {hours_left}h {mins_left}m
+                            </div>
+                            <div style="color:#58a6ff; font-family:monospace; font-size:11px;">{m['ticker']}</div>
+                            <div style="font-size:18px; font-weight:600; margin:2px 0;">{m['event']}</div>
+                            <div style="color:#8b949e; font-size:14px;">{m['market']}</div>
                         </div>
-                        <div style="display:flex; gap:10px;">
-                            <div class="price-box-yes">{m['y']}¢</div>
-                            <div class="price-box-no">{m['n']}¢</div>
+                        <div style="display:flex; gap:12px;">
+                            <div class="price-box"><span style="font-size:9px; color:#888;">YES</span><div class="yes-val">{m['y']}</div></div>
+                            <div class="price-box"><span style="font-size:9px; color:#888;">NO</span><div class="no-val">{m['n']}</div></div>
                         </div>
                     </div>
                 </div>
