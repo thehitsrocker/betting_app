@@ -3,24 +3,28 @@ import pandas as pd
 import requests
 import time
 import base64
-import re
 from datetime import datetime
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 # --- 1. CONFIG & STYLING ---
-st.set_page_config(page_title="Kalshi Pro v6", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Kalshi Pro v8", page_icon="📈", layout="wide")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #0e1117; }
-    .market-row {
-        background-color: #1e2130; border-radius: 8px; padding: 15px;
-        margin-bottom: 10px; border: 1px solid #30364d;
+    .stApp { background-color: #0e1117; color: white; }
+    .market-card {
+        background-color: #1e2130; border-radius: 10px; padding: 20px;
+        margin-bottom: 15px; border: 1px solid #30364d;
     }
-    .price-val { font-weight: bold; font-size: 18px; }
-    .yes-color { color: #00e676; }
-    .no-color { color: #ff5252; }
+    .price-box { background: #2a2e3f; padding: 10px 20px; border-radius: 5px; text-align: center; min-width: 90px; }
+    .yes-val { color: #00e676; font-size: 22px; font-weight: bold; }
+    .no-val { color: #ff5252; font-size: 22px; font-weight: bold; }
+    .ticker-label { color: #888; font-family: monospace; font-size: 11px; letter-spacing: 1px; }
+    .category-tag { 
+        background: #3e445e; color: #fff; padding: 2px 8px; 
+        border-radius: 4px; font-size: 10px; text-transform: uppercase;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -32,105 +36,140 @@ def sign_request(private_key_str, method, path, timestamp):
     try:
         private_key = serialization.load_pem_private_key(private_key_str.encode(), password=None)
         msg = f"{timestamp}{method}{path}"
-        signature = private_key.sign(msg.encode("utf-8"), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+        signature = private_key.sign(
+            msg.encode("utf-8"), 
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), 
+            hashes.SHA256()
+        )
         return base64.b64encode(signature).decode("utf-8")
-    except: return None
+    except Exception as e:
+        st.error(f"Auth Error: {e}")
+        return None
 
-# --- 3. DATA FETCHING (STRICT LOGIC) ---
-@st.cache_data(ttl=60)
-def fetch_markets_v6(user_selection):
+# --- 3. OPTIMIZED DATA FETCHING (PREVENTS API LIMIT HITS) ---
+@st.cache_data(ttl=60) # Cache for 60s to avoid redundant API calls
+def fetch_global_feed():
     path = f"{BASE_PATH}/events"
     try:
-        key_id, priv_key = st.secrets["KALSHI_KEY_ID"], st.secrets["KALSHI_PRIVATE_KEY"]
-    except: return []
+        key_id = st.secrets["KALSHI_KEY_ID"]
+        priv_key = st.secrets["KALSHI_PRIVATE_KEY"]
+    except:
+        st.error("Missing KALSHI_KEY_ID or KALSHI_PRIVATE_KEY in Streamlit Secrets.")
+        return []
 
     ts = str(int(time.time() * 1000))
     sig = sign_request(priv_key, "GET", path, ts)
-    headers = {"KALSHI-ACCESS-KEY": key_id, "KALSHI-ACCESS-SIGNATURE": sig, "KALSHI-ACCESS-TIMESTAMP": ts, "Accept": "application/json"}
     
-    all_events = []
-    cursor = None
-    for _ in range(5): # Scan up to 500 events
-        params = {"status": "open", "limit": 100, "with_nested_markets": True}
-        if cursor: params['cursor'] = cursor
-        res = requests.get(f"{HOST}{path}", headers=headers, params=params)
-        if res.status_code != 200: break
-        data = res.json()
-        all_events.extend(data.get("events", []))
-        cursor = data.get("cursor")
-        if not cursor: break
+    headers = {
+        "KALSHI-ACCESS-KEY": key_id, 
+        "KALSHI-ACCESS-SIGNATURE": sig, 
+        "KALSHI-ACCESS-TIMESTAMP": ts, 
+        "Accept": "application/json"
+    }
+    
+    # Fetch 200 events (The max allowed in one call to maximize data per hit)
+    params = {"status": "open", "limit": 200, "with_nested_markets": True}
+    
+    try:
+        response = requests.get(f"{HOST}{path}", headers=headers, params=params)
+        if response.status_code == 200:
+            return response.json().get("events", [])
+        else:
+            st.error(f"Kalshi API Error {response.status_code}: {response.text}")
+            return []
+    except Exception as e:
+        st.error(f"Connection Error: {e}")
+        return []
 
-    # --- STRICT FILTERING ENGINE ---
-    filtered = []
-    sel = user_selection.lower()
+# --- 4. MAIN UI & LOCAL FILTERING ---
+def main():
+    st.sidebar.title("⚡ Kalshi Pro v8")
+    view_mode = st.sidebar.selectbox("Market Filter", ["All Markets", "Tennis", "Soccer", "Politics", "Economics", "Crypto"])
+    min_liquidity = st.sidebar.slider("Min 'Yes' Bid (¢)", 0, 99, 1)
+
+    if st.sidebar.button("Force Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.title(f"Live Terminal: {view_mode}")
     
-    for e in all_events:
+    # 1. Fetch ALL data once
+    raw_events = fetch_global_feed()
+    
+    if not raw_events:
+        st.warning("No data returned from Kalshi. Check your API keys and internet connection.")
+        return
+
+    # 2. Filter LOCAL data based on selection (Does NOT hit API again)
+    filtered_markets = []
+    mode = view_mode.lower()
+
+    for e in raw_events:
         title = e.get("title", "").lower()
+        ticker = e.get("ticker", "").upper()
         cat = e.get("category", "").lower()
-        ticker = e.get("ticker", "").lower()
         
         is_match = False
-        
-        if sel == "tennis":
-            # Match only if Category is Sports AND Title contains Tennis/ATP/WTA
-            if "sports" in cat and any(x in title for x in ["tennis", "atp", "wta", "challenger"]):
+        if mode == "all markets":
+            is_match = True
+        elif mode == "tennis":
+            if "TENNIS" in ticker or any(x in title for x in ["atp", "wta", "itf", "tennis", "open"]):
                 is_match = True
-        elif sel == "soccer":
-            if "sports" in cat and any(x in title for x in ["soccer", "fifa", "uefa", "mls", "premier"]):
+        elif mode == "soccer":
+            if "SOC" in ticker or any(x in title for x in ["soccer", "premier league", "mls", "uefa"]):
                 is_match = True
-        elif sel == "politics":
-            if "politics" in cat or any(x in title for x in ["election", "president", "trump", "biden"]):
+        elif mode == "politics":
+            if cat == "politics" or any(x in title for x in ["election", "president", "trump", "biden"]):
                 is_match = True
-        elif sel == "economics":
-            if "economics" in cat or any(x in title for x in ["fed ", "inflation", "cpi", "gdp", "recession"]):
+        elif mode == "economics":
+            if cat == "economics" or any(x in title for x in ["fed", "inflation", "cpi", "rate"]):
                 is_match = True
-        elif sel == "crypto":
-            if any(x in title or x in ticker for x in ["bitcoin", "btc", "eth", "crypto"]):
+        elif mode == "crypto":
+            if any(x in title or x in ticker for x in ["btc", "eth", "crypto", "bitcoin"]):
                 is_match = True
 
         if is_match:
             for m in e.get("markets", []):
-                m['event_title'] = e.get('title')
-                filtered.append(m)
-    return filtered
+                m['parent_event_title'] = e.get('title')
+                m['parent_category'] = e.get('category', 'General')
+                filtered_markets.append(m)
 
-# --- 4. RENDERER ---
-def parse_p(m, side):
-    val = m.get(f"{side}_bid")
-    if val is not None: return int(val)
-    val_s = m.get(f"{side}_bid_dollars")
-    try: return int(float(val_s) * 100) if val_s else 0
-    except: return 0
+    # 3. Apply secondary filters (Price/Liquidity)
+    final_list = [m for m in filtered_markets if int(m.get('yes_bid', 0)) >= min_liquidity]
 
-def main():
-    with st.sidebar:
-        st.header("⚡ Kalshi Pro v6")
-        cat = st.selectbox("Category", ["Tennis", "Soccer", "Politics", "Economics", "Crypto"])
-        min_liq = st.slider("Min Price", 0, 99, 1)
-
-    st.title(f"Strict Feed: {cat}")
-    markets = fetch_markets_v6(cat)
-    valid = [m for m in markets if parse_p(m, "yes") >= min_liq]
-
-    if not valid:
-        st.info(f"No strict matches for {cat}. Tennis/Soccer matches often appear closer to game time.")
+    if not final_list:
+        st.info(f"No {view_mode} matches found with the current filters.")
     else:
-        st.success(f"Verified {len(valid)} {cat} Contracts")
-        for m in valid[:40]:
-            with st.container():
-                st.markdown(f"""
-                <div class="market-row">
-                    <div style="display:flex; justify-content:space-between;">
-                        <span style="color:#aaa; font-size:12px;">{m.get('ticker')}</span>
-                        <span style="color:#aaa; font-size:12px;">{m.get('close_time')[:10]}</span>
-                    </div>
-                    <div class="market-title">{m.get('event_title')}</div>
-                    <div style="margin-top:10px; display:flex; gap:40px;">
-                        <div><span style="font-size:10px; color:#888;">YES BID</span><br><span class="price-val yes-color">{parse_p(m, 'yes')}¢</span></div>
-                        <div><span style="font-size:10px; color:#888;">NO BID</span><br><span class="price-val no-color">{parse_p(m, 'no')}¢</span></div>
+        st.caption(f"Showing {len(final_list)} active contracts from {len(raw_events)} events scanned.")
+        
+        for m in final_list:
+            yes_p = int(m.get('yes_bid', 0))
+            no_p = int(m.get('no_bid', 0))
+            
+            st.markdown(f"""
+                <div class="market-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div style="max-width: 70%;">
+                            <div style="display:flex; gap:10px; align-items:center; margin-bottom:5px;">
+                                <span class="ticker-label">{m.get('ticker')}</span>
+                                <span class="category-tag">{m.get('parent_category')}</span>
+                            </div>
+                            <div style="font-size: 18px; font-weight: 500;">{m.get('parent_event_title')}</div>
+                            <div style="color: #aaa; font-size: 14px; margin-top:4px;">{m.get('subtitle', m.get('title', ''))}</div>
+                        </div>
+                        <div style="display:flex; gap:12px;">
+                            <div class="price-box">
+                                <div style="font-size:10px; color:#888; margin-bottom:3px;">YES BID</div>
+                                <div class="yes-val">{yes_p}¢</div>
+                            </div>
+                            <div class="price-box">
+                                <div style="font-size:10px; color:#888; margin-bottom:3px;">NO BID</div>
+                                <div class="no-val">{no_p}¢</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
