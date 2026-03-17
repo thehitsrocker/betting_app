@@ -8,10 +8,10 @@ from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# --- 1. CONFIG & STYLING ---
+# --- 1. APP CONFIGURATION ---
 st.set_page_config(
     page_title="Kalshi Pro",
-    page_icon="🎾",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -21,19 +21,21 @@ st.markdown("""
     .stApp { background-color: #0e1117; }
     .market-card {
         background-color: #1e2130;
-        border-radius: 10px;
-        padding: 15px;
-        margin-bottom: 10px;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 8px;
         border: 1px solid #30364d;
     }
     .market-card:hover { border-color: #4dabf7; }
-    .market-title { font-weight: 700; font-size: 15px; color: #ffffff; margin-bottom: 5px; }
+    .market-title { font-weight: 600; font-size: 14px; color: #ffffff; margin-bottom: 4px; }
     .sub-text { font-size: 11px; color: #a0a0a0; }
-    .price-green { color: #00e676; font-weight: bold; font-size: 18px; }
-    .price-red { color: #ff5252; font-weight: bold; font-size: 18px; }
-    .league-tag {
-        background-color: #262a40; color: #4dabf7; padding: 2px 8px;
-        border-radius: 4px; font-size: 10px; font-weight: bold; letter-spacing: 1px;
+    .price-box {
+        background: #262a40; padding: 4px; border-radius: 4px; text-align: center;
+    }
+    .price-green { color: #00e676; font-weight: bold; font-size: 16px; }
+    .price-red { color: #ff5252; font-weight: bold; font-size: 16px; }
+    .tag {
+        font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #333; color: #bbb;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -57,12 +59,12 @@ def sign_request(private_key_str, method, path, timestamp):
     except Exception:
         return None
 
-# --- 3. OMNI-SEARCH LOGIC ---
+# --- 3. ROBUST DATA FETCHING (WITH PAGINATION) ---
 @st.cache_data(ttl=60)
-def fetch_sports_markets(sport_keyword):
+def fetch_all_markets(category_query):
     """
-    Fetches ALL 'Sports' events and filters manually for keywords like 'Tennis', 'ATP', 'WTA'.
-    This bypasses the API's strict category limitations.
+    Fetches MULTIPLE pages of events to ensure we find Politics/Economics 
+    even if they are buried behind 100s of Tennis matches.
     """
     path = f"{BASE_PATH}/events"
     
@@ -75,50 +77,66 @@ def fetch_sports_markets(sport_keyword):
 
     ts = str(int(time.time() * 1000))
     sig = sign_request(priv_key, "GET", path, ts)
-    
-    if not sig: return []
-
     headers = {
-        "KALSHI-ACCESS-KEY": key_id,
-        "KALSHI-ACCESS-SIGNATURE": sig,
+        "KALSHI-ACCESS-KEY": key_id, 
+        "KALSHI-ACCESS-SIGNATURE": sig, 
         "KALSHI-ACCESS-TIMESTAMP": ts,
         "Accept": "application/json"
     }
     
-    # We fetch "Sports" generally, then filter in Python
-    params = {"status": "open", "limit": 500, "with_nested_markets": True}
+    # API MAX LIMIT is 200. Sending 500 causes error 400.
+    params = {"status": "open", "limit": 100, "with_nested_markets": True}
     
-    try:
-        response = requests.get(f"{HOST}{path}", headers=headers, params=params)
-        if response.status_code != 200: return []
-        
-        events = response.json().get("events", [])
-        matches = []
-        
-        # Keywords to identify the sport
-        # If user selects "Tennis", we look for: Tennis, ATP, WTA, Challenger, ITF
-        search_terms = [sport_keyword.lower()]
-        if sport_keyword == "Tennis":
-            search_terms += ["atp", "wta", "challenger", "itf", "australian", "french", "wimbledon", "us open"]
-        elif sport_keyword == "NBA":
-            search_terms += ["basketball"]
+    all_events = []
+    cursor = None
+    
+    # PAGINATION LOOP: Fetch up to 5 pages (500 events) to find our data
+    for _ in range(5):
+        if cursor:
+            params['cursor'] = cursor
             
-        for e in events:
-            # Check if any keyword is in the Title, Category, or Ticker
-            e_str = f"{e.get('title')} {e.get('category')} {e.get('ticker')}".lower()
+        try:
+            response = requests.get(f"{HOST}{path}", headers=headers, params=params)
+            if response.status_code != 200:
+                break # Stop if error
+                
+            data = response.json()
+            events = data.get("events", [])
+            all_events.extend(events)
             
-            if any(term in e_str for term in search_terms):
-                for m in e.get("markets", []):
-                    # Inject event details into the market object
-                    m['event_title'] = e.get('title')
-                    m['series_ticker'] = e.get('series_ticker', '')
-                    matches.append(m)
-                    
-        return matches
+            cursor = data.get("cursor")
+            if not cursor:
+                break # No more pages
+        except:
+            break
 
-    except Exception as e:
-        st.error(f"Connection Error: {e}")
-        return []
+    # FILTERING LOGIC
+    filtered_markets = []
+    q = category_query.lower()
+    
+    # Enhanced Keywords mapping
+    keywords = {
+        "economics": ["economics", "economy", "fed", "inflation", "gdp", "cpi", "rate", "recession", "financial"],
+        "politics": ["politics", "president", "election", "senate", "house", "trump", "biden", "vote", "government"],
+        "tennis": ["tennis", "atp", "wta", "challenger", "itf", "open", "wimbledon"],
+        "soccer": ["soccer", "league", "fifa", "uefa", "goal"],
+        "crypto": ["crypto", "bitcoin", "btc", "eth", "price"]
+    }
+    
+    target_words = keywords.get(q, [q])
+
+    for e in all_events:
+        # Create a searchable string from all available text fields
+        search_text = f"{e.get('title', '')} {e.get('category', '')} {e.get('ticker', '')}".lower()
+        
+        # Check if ANY target word exists in the event text
+        if any(w in search_text for w in target_words):
+            for m in e.get("markets", []):
+                m['event_title'] = e.get('title')
+                m['event_cat'] = e.get('category')
+                filtered_markets.append(m)
+                
+    return filtered_markets
 
 # --- 4. HELPERS ---
 def parse_price(market, side="yes"):
@@ -128,100 +146,74 @@ def parse_price(market, side="yes"):
     try: return int(float(p_str) * 100) if p_str else 0
     except: return 0
 
-def format_start_time(iso_str):
+def format_time(iso_str):
     if not iso_str: return ""
     try:
         dt = datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%SZ")
-        now = datetime.now()
-        # If today, show time. If future, show Date + Time
-        if dt.date() == now.date():
-            return f"Today, {dt.strftime('%H:%M')}"
-        return dt.strftime("%b %d, %H:%M")
+        if dt.date() == datetime.now().date():
+            return f"Today {dt.strftime('%H:%M')}"
+        return dt.strftime("%b %d")
     except:
-        return iso_str
-
-def get_league_tag(ticker):
-    if "ATP" in ticker: return "ATP TOUR"
-    if "WTA" in ticker: return "WTA TOUR"
-    if "NBA" in ticker: return "NBA"
-    return "PRO SPORT"
+        return ""
 
 # --- 5. UI RENDERER ---
-def render_market_card(market):
-    ticker = market.get('ticker')
-    event_title = market.get('event_title', 'Match')
-    
-    # Tennis titles are often "Player A vs Player B"
-    # We can clean this up if it's too long
-    display_title = event_title
-    
-    yes_bid = parse_price(market, "yes")
-    no_bid = parse_price(market, "no")
-    league = get_league_tag(market.get('series_ticker', ''))
-
-    with st.container():
-        st.markdown(f"""
-        <div class="market-card">
-            <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-                <span class="league-tag">{league}</span>
-                <span class="sub-text">⏱️ {format_start_time(market.get('close_time'))}</span>
-            </div>
-            <div class="market-title">{display_title}</div>
-            <div class="sub-text" style="margin-bottom:10px;">{ticker}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        c1, c2, c3 = st.columns([1, 1, 1.2])
+def render_row(m):
+    ticker = m.get('ticker')
+    title = m.get('title', 'Market')
+    # If title is a massive list of legs, use event title
+    if len(title) > 80:
+        title = m.get('event_title', title)
         
-        # Use grey if price is 0 (illiquid)
-        c_yes = "price-green" if yes_bid > 0 else "sub-text"
-        c_no = "price-red" if no_bid > 0 else "sub-text"
-
+    yes = parse_price(m, "yes")
+    no = parse_price(m, "no")
+    
+    with st.container():
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+        
         with c1:
-            st.markdown(f"<div style='text-align:center'><div style='font-size:10px; color:#aaa'>YES</div><div class='{c_yes}'>{yes_bid}¢</div></div>", unsafe_allow_html=True)
+            st.markdown(f"**{title}**")
+            st.caption(f"{ticker} • {format_time(m.get('close_time'))}")
+            
         with c2:
-            st.markdown(f"<div style='text-align:center'><div style='font-size:10px; color:#aaa'>NO</div><div class='{c_no}'>{no_bid}¢</div></div>", unsafe_allow_html=True)
-        with c3:
-            st.button("TRADE", key=f"btn_{ticker}", use_container_width=True)
+            # Yes Price
+            color = "price-green" if yes > 0 else "sub-text"
+            st.markdown(f"<div class='price-box'><span class='sub-text'>YES</span><br><span class='{color}'>{yes}¢</span></div>", unsafe_allow_html=True)
 
-# --- 6. MAIN APP ---
+        with c3:
+            # No Price
+            color = "price-red" if no > 0 else "sub-text"
+            st.markdown(f"<div class='price-box'><span class='sub-text'>NO</span><br><span class='{color}'>{no}¢</span></div>", unsafe_allow_html=True)
+            
+        with c4:
+            st.button("Trade", key=ticker, use_container_width=True)
+        
+        st.markdown("---")
+
+# --- 6. MAIN ---
 def main():
     with st.sidebar:
-        st.header("🎾 Pro Tennis Terminal")
-        sport = st.selectbox("Sport Selection", ["Tennis", "NBA", "Soccer", "Economics", "Politics"])
-        st.divider()
-        min_liq = st.slider("Min Liquidity (¢)", 1, 99, 1)
-        if st.button("🔄 Force Refresh"):
-            st.cache_data.clear()
+        st.header("⚡ Kalshi Pro v5")
+        cat = st.selectbox("Market", ["Politics", "Economics", "Tennis", "NBA", "Soccer", "Crypto"])
+        min_liq = st.slider("Min Price", 0, 99, 1)
+        st.info("v5.0: Auto-Pagination Enabled (Scans 500+ events)")
 
-    st.title(f"Live {sport} Feed")
-
-    with st.spinner(f"Scanning Global Markets for {sport}..."):
-        # Logic: If Economics/Politics, use standard fetch. If Sports, use Omni-Search.
-        if sport in ["Tennis", "NBA", "Soccer"]:
-            markets = fetch_sports_markets(sport)
-        else:
-            # Fallback for non-sports if you want to keep using the other function
-            # For this snippet, I'll just map them to the same function 
-            # assuming "Economics" works as a keyword search too.
-            markets = fetch_sports_markets(sport)
-
-    # Filter by liquidity
-    valid_markets = [m for m in markets if parse_price(m, "yes") >= min_liq]
-
-    if valid_markets:
-        st.success(f"Found {len(valid_markets)} Active Contracts")
+    st.title(f"{cat} Feed")
+    
+    with st.spinner(f"Scanning exchange for {cat} (Pages 1-5)..."):
+        markets = fetch_all_markets(cat)
         
-        # Sort by time (soonest first)
-        valid_markets.sort(key=lambda x: x.get('close_time', ''))
+    # Filter
+    valid = [m for m in markets if parse_price(m, "yes") >= min_liq]
+    
+    if valid:
+        st.success(f"Found {len(valid)} Contracts")
+        # Sort: Liquidity high to low, then time soonest
+        valid.sort(key=lambda x: parse_price(x, "yes"), reverse=True)
         
-        cols = st.columns(3)
-        for i, m in enumerate(valid_markets):
-            with cols[i % 3]:
-                render_market_card(m)
+        for m in valid[:50]: # Show top 50 to avoid lag
+            render_row(m)
     else:
-        st.warning(f"No markets found for {sport} with price >= {min_liq}¢.")
-        st.info("Tip: Try lowering the liquidity filter to 1¢ to see illiquid markets.")
+        st.warning("No markets found. The API is connected, but no matching events were found in the top 500 results.")
 
 if __name__ == "__main__":
     main()
