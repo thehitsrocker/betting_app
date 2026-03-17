@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 # --- 1. CONFIG & STYLING ---
-st.set_page_config(page_title="Kalshi Pro v19", page_icon="🎾", layout="wide")
+st.set_page_config(page_title="Kalshi Pro v20", page_icon="🎾", layout="wide")
 
 st.markdown("""
     <style>
@@ -45,7 +45,7 @@ def sign_request(private_key_str, method, path, timestamp):
         return base64.b64encode(signature).decode("utf-8")
     except: return None
 
-# --- 3. DATA FETCHING (MAX SCAN) ---
+# --- 3. DATA FETCHING (DEEP SCAN) ---
 @st.cache_data(ttl=30)
 def fetch_deep_scan():
     path = f"{BASE_PATH}/events"
@@ -59,22 +59,23 @@ def fetch_deep_scan():
     
     results = []
     cursor = None
-    # Scanning 8 pages (800 events) to ensure we catch all 108+ tennis matches
     for _ in range(8):
         params = {"status": "open", "limit": 100, "with_nested_markets": True}
         if cursor: params["cursor"] = cursor
-        res = requests.get(f"{HOST}{path}", headers=headers, params=params)
-        if res.status_code != 200: break
-        data = res.json()
-        results.extend(data.get("events", []))
-        cursor = data.get("cursor")
-        if not cursor: break
+        try:
+            res = requests.get(f"{HOST}{path}", headers=headers, params=params)
+            if res.status_code != 200: break
+            data = res.json()
+            results.extend(data.get("events", []))
+            cursor = data.get("cursor")
+            if not cursor: break
+        except: break
     return results
 
 # --- 4. MAIN UI ---
 def main():
-    st.sidebar.title("🎾 Match Monitor v19")
-    view = st.sidebar.selectbox("Filter", ["Tennis Next 24h", "Live Now", "Politics", "All"])
+    st.sidebar.title("🎾 Match Monitor v20")
+    view = st.sidebar.selectbox("Filter", ["Tennis Next 24h", "Soccer Next 24h", "Live Now", "All"])
     
     all_events = fetch_deep_scan()
     now = datetime.now(timezone.utc)
@@ -84,18 +85,25 @@ def main():
     for e in all_events:
         t, tick = e.get("title", "").lower(), e.get("ticker", "").upper()
         
-        # Time Logic
-        close_ts = datetime.fromisoformat(e.get("close_time").replace("Z", "+00:00"))
+        # --- SAFE DATE PARSING ---
+        raw_close = e.get("close_time")
+        if not raw_close: continue # Skip if no time data
+        
+        try:
+            close_ts = datetime.fromisoformat(raw_close.replace("Z", "+00:00"))
+        except: continue
+        
         is_next_24h = now <= close_ts <= one_day_out
         
-        # Tennis Logic (Strict Ticker)
-        is_tennis = any(x in tick for x in ["TENNIS", "KXWTA", "KXATP"]) or "tennis" in t
-        
         match = False
-        if view == "Tennis Next 24h": match = is_tennis and is_next_24h
-        elif view == "Live Now": match = is_next_24h
-        elif view == "Politics": match = e.get("category") == "Politics"
-        elif view == "All": match = True
+        if view == "Tennis Next 24h":
+            match = (any(x in tick for x in ["TENNIS", "KXWTA", "KXATP"]) or "tennis" in t) and is_next_24h
+        elif view == "Soccer Next 24h":
+            match = (any(x in tick for x in ["SOC", "KXMLS", "KXUCL"]) or "soccer" in t) and is_next_24h
+        elif view == "Live Now":
+            match = is_next_24h
+        elif view == "All":
+            match = True
 
         if match:
             for m in e.get("markets", []):
@@ -113,23 +121,22 @@ def main():
 
     st.title(f"Feed: {view}")
     if not filtered:
-        st.info(f"No matches found. If you see 'Tennis Next 24h' is empty, Kalshi may have moved these to the 'Sports' category without a TENNIS ticker.")
+        st.info(f"No matches found for {view}. Ensure your scan limit is high enough to reach these events.")
     else:
-        st.write(f"Showing {len(filtered)} contracts closing within 24h.")
-        # Sort by closing time (closest first)
+        # Sort matches by start time (closest first)
         sorted_list = sorted(filtered, key=lambda x: x['close_ts'])
         
         for m in sorted_list:
             time_diff = m['close_ts'] - now
-            hours_left = int(time_diff.total_seconds() // 3600)
-            mins_left = int((time_diff.total_seconds() % 3600) // 60)
+            h, m_rem = divmod(int(time_diff.total_seconds()), 3600)
+            m_rem //= 60
             
             st.markdown(f"""
                 <div class="card">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <div style="max-width:75%;">
-                            <div class="status-tag {'live-tag' if hours_left < 1 else 'upcoming-tag'}">
-                                {'LIVE' if hours_left < 1 else 'UPCOMING'} - CLoses in {hours_left}h {mins_left}m
+                            <div class="status-tag { 'live-tag' if h < 1 else 'upcoming-tag' }">
+                                { 'LIVE' if h < 1 else 'UPCOMING' } - {h}h {m_rem}m left
                             </div>
                             <div style="color:#58a6ff; font-family:monospace; font-size:11px;">{m['ticker']}</div>
                             <div style="font-size:18px; font-weight:600; margin:2px 0;">{m['event']}</div>
