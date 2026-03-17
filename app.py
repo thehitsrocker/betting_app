@@ -7,27 +7,8 @@ from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# --- 1. CONFIG & STYLING ---
-st.set_page_config(page_title="Kalshi Pro v20", page_icon="🎾", layout="wide")
-
-st.markdown("""
-    <style>
-    .stApp { background-color: #0d1117; color: #e6edf3; }
-    .card {
-        background-color: #161b22; border: 1px solid #30363d;
-        border-radius: 8px; padding: 15px; margin-bottom: 10px;
-    }
-    .status-tag {
-        font-weight: bold; font-size: 10px; padding: 2px 8px; 
-        border-radius: 4px; text-transform: uppercase; margin-bottom: 8px; display: inline-block;
-    }
-    .live-tag { color: #ff3e3e; border: 1px solid #ff3e3e; background: #2d0001; }
-    .upcoming-tag { color: #58a6ff; border: 1px solid #58a6ff; background: #00152d; }
-    .price-box { background: #26293b; padding: 10px; border-radius: 4px; text-align: center; min-width: 85px; border: 1px solid #3e445e; }
-    .yes-val { color: #3fb950; font-size: 20px; font-weight: bold; }
-    .no-val { color: #f85149; font-size: 20px; font-weight: bold; }
-    </style>
-""", unsafe_allow_html=True)
+# --- 1. CONFIG ---
+st.set_page_config(page_title="Kalshi Pro v21", page_icon="🎾", layout="wide")
 
 # --- 2. AUTHENTICATION ---
 HOST = "https://api.elections.kalshi.com"
@@ -45,7 +26,7 @@ def sign_request(private_key_str, method, path, timestamp):
         return base64.b64encode(signature).decode("utf-8")
     except: return None
 
-# --- 3. DATA FETCHING (DEEP SCAN) ---
+# --- 3. DATA FETCHING ---
 @st.cache_data(ttl=30)
 def fetch_deep_scan():
     path = f"{BASE_PATH}/events"
@@ -59,23 +40,22 @@ def fetch_deep_scan():
     
     results = []
     cursor = None
-    for _ in range(8):
-        params = {"status": "open", "limit": 100, "with_nested_markets": True}
+    # Scan more pages to ensure we reach sports data
+    for _ in range(10):
+        params = {"status": "open", "limit": 200, "with_nested_markets": "true"}
         if cursor: params["cursor"] = cursor
-        try:
-            res = requests.get(f"{HOST}{path}", headers=headers, params=params)
-            if res.status_code != 200: break
-            data = res.json()
-            results.extend(data.get("events", []))
-            cursor = data.get("cursor")
-            if not cursor: break
-        except: break
+        res = requests.get(f"{HOST}{path}", headers=headers, params=params)
+        if res.status_code != 200: break
+        data = res.json()
+        results.extend(data.get("events", []))
+        cursor = data.get("cursor")
+        if not cursor: break
     return results
 
 # --- 4. MAIN UI ---
 def main():
-    st.sidebar.title("🎾 Match Monitor v20")
-    view = st.sidebar.selectbox("Filter", ["Tennis Next 24h", "Soccer Next 24h", "Live Now", "All"])
+    st.sidebar.title("🎾 Match Monitor v21")
+    view = st.sidebar.selectbox("Filter", ["All", "Tennis Next 24h", "Soccer Next 24h", "Live Now"])
     
     all_events = fetch_deep_scan()
     now = datetime.now(timezone.utc)
@@ -84,29 +64,28 @@ def main():
     filtered = []
     for e in all_events:
         t, tick = e.get("title", "").lower(), e.get("ticker", "").upper()
+        raw_close = e.get("close_time") or e.get("strike_date") # Fallback for some event types
         
-        # --- SAFE DATE PARSING ---
-        raw_close = e.get("close_time")
-        if not raw_close: continue # Skip if no time data
-        
+        if not raw_close: continue
         try:
             close_ts = datetime.fromisoformat(raw_close.replace("Z", "+00:00"))
         except: continue
         
         is_next_24h = now <= close_ts <= one_day_out
         
+        # Broaden match logic for sports
+        is_tennis = any(x in tick for x in ["TENNIS", "WTA", "ATP"]) or "tennis" in t
+        is_soccer = any(x in tick for x in ["SOC", "MLS", "UCL"]) or "soccer" in t
+        
         match = False
-        if view == "Tennis Next 24h":
-            match = (any(x in tick for x in ["TENNIS", "KXWTA", "KXATP"]) or "tennis" in t) and is_next_24h
-        elif view == "Soccer Next 24h":
-            match = (any(x in tick for x in ["SOC", "KXMLS", "KXUCL"]) or "soccer" in t) and is_next_24h
-        elif view == "Live Now":
-            match = is_next_24h
-        elif view == "All":
-            match = True
+        if view == "All": match = True
+        elif view == "Tennis Next 24h": match = is_tennis and is_next_24h
+        elif view == "Soccer Next 24h": match = is_soccer and is_next_24h
+        elif view == "Live Now": match = is_next_24h
 
         if match:
             for m in e.get("markets", []):
+                # Handle cents vs dollars
                 y = int(float(m.get('yes_bid_dollars', 0)) * 100)
                 n = int(float(m.get('no_bid_dollars', 0)) * 100)
                 
@@ -116,39 +95,17 @@ def main():
                     "market": m.get('title'),
                     "y": f"{y}¢" if y > 0 else "N/A",
                     "n": f"{n}¢" if n > 0 else "N/A",
-                    "close_ts": close_ts
+                    "close_ts": close_ts,
+                    "category": e.get("category", "General")
                 })
 
     st.title(f"Feed: {view}")
     if not filtered:
-        st.info(f"No matches found for {view}. Ensure your scan limit is high enough to reach these events.")
+        st.info(f"No results found. Total scanned events: {len(all_events)}. Try selecting 'All' to check data flow.")
     else:
-        # Sort matches by start time (closest first)
-        sorted_list = sorted(filtered, key=lambda x: x['close_ts'])
-        
-        for m in sorted_list:
-            time_diff = m['close_ts'] - now
-            h, m_rem = divmod(int(time_diff.total_seconds()), 3600)
-            m_rem //= 60
-            
-            st.markdown(f"""
-                <div class="card">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div style="max-width:75%;">
-                            <div class="status-tag { 'live-tag' if h < 1 else 'upcoming-tag' }">
-                                { 'LIVE' if h < 1 else 'UPCOMING' } - {h}h {m_rem}m left
-                            </div>
-                            <div style="color:#58a6ff; font-family:monospace; font-size:11px;">{m['ticker']}</div>
-                            <div style="font-size:18px; font-weight:600; margin:2px 0;">{m['event']}</div>
-                            <div style="color:#8b949e; font-size:14px;">{m['market']}</div>
-                        </div>
-                        <div style="display:flex; gap:12px;">
-                            <div class="price-box"><span style="font-size:9px; color:#888;">YES</span><div class="yes-val">{m['y']}</div></div>
-                            <div class="price-box"><span style="font-size:9px; color:#888;">NO</span><div class="no-val">{m['n']}</div></div>
-                        </div>
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
+        st.write(f"Showing {len(filtered)} contracts.")
+        for m in sorted(filtered, key=lambda x: x['close_ts']):
+            st.write(f"**[{m['category']}] {m['event']}** - {m['market']} | YES: {m['y']} NO: {m['n']}")
 
 if __name__ == "__main__":
     main()
